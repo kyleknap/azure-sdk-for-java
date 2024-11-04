@@ -10,6 +10,7 @@ import com.azure.core.util.tracing.Tracer;
 import com.azure.core.util.tracing.TracerProvider;
 import com.azure.storage.common.ParallelTransferOptions;
 import com.azure.storage.file.share.ShareFileAsyncClient;
+import com.azure.storage.file.share.models.ShareFileProperties;
 import com.azure.storage.stress.ContentInfo;
 import com.azure.storage.stress.ContentMismatchException;
 import com.azure.storage.stress.CrcInputStream;
@@ -33,6 +34,7 @@ public class OriginalContent {
     private static final BinaryData FILE_CONTENT_HEAD = BinaryData.fromString(FILE_CONTENT_HEAD_STRING);
     private long dataChecksum = -1;
     private long fileSize = 0;
+    private long fileSizeAfterSetup = 0;
 
     public Mono<Void> setupFile(ShareFileAsyncClient fileAsyncClient, long fileSize) {
         if (dataChecksum != -1) {
@@ -48,7 +50,13 @@ public class OriginalContent {
                             new ParallelTransferOptions().setMaxSingleUploadSizeLong(4 * 1024 * 1024L).setMaxConcurrency(1))
                         .then(data.getContentInfo()), CrcInputStream::close))
             .map(info -> dataChecksum = info.getCrc())
-            .then();
+            .then(fileAsyncClient.getProperties()
+                .doOnNext(properties -> {
+                    System.out.println(properties.getContentLength());
+                    LOGGER.info("File size after setup: {}", properties.getContentLength());
+                    fileSizeAfterSetup = properties.getContentLength();
+                })
+                .then());
     }
 
     public Mono<Void> checkMatch(BinaryData data, Context span) {
@@ -82,6 +90,7 @@ public class OriginalContent {
                 .addKeyValue("expectedCrc", dataChecksum)
                 .addKeyValue("actualCrc", actualCrc)
                 .addKeyValue("expectedLength", fileSize)
+                .addKeyValue("actualLengthAfterSetup", fileSizeAfterSetup)
                 .addKeyValue("actualLength", actualLength)
                 .addKeyValue("actualContentHead", Base64.getEncoder().encode(actualContentHead))
                 .log("mismatched crc");

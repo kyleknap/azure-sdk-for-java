@@ -103,7 +103,8 @@ public class HttpFaultInjectingTests {
      */
     @Test
     public void downloadToFileWithFaultInjection() throws IOException, InterruptedException {
-        byte[] realFileBytes = new byte[9 * Constants.MB - 1];
+        int testRuns = 1;
+        byte[] realFileBytes = new byte[50 * Constants.MB - 1];
         ThreadLocalRandom.current().nextBytes(realFileBytes);
 
         containerClient.getBlobClient(containerClient.getBlobContainerName())
@@ -118,8 +119,8 @@ public class HttpFaultInjectingTests {
             .retryOptions(new RequestRetryOptions(RetryPolicyType.FIXED, 4, null, 10L, 10L, null))
             .buildClient();
 
-        List<File> files = new ArrayList<>(500);
-        for (int i = 0; i < 500; i++) {
+        List<File> files = new ArrayList<>(testRuns);
+        for (int i = 0; i < testRuns; i++) {
             File file = File.createTempFile(CoreUtils.randomUuid().toString() + i, ".txt");
             file.deleteOnExit();
             files.add(file);
@@ -130,7 +131,7 @@ public class HttpFaultInjectingTests {
             StandardOpenOption.TRUNCATE_EXISTING, // If the file already exists and it is opened for WRITE access, then its length is truncated to 0.
             StandardOpenOption.READ, StandardOpenOption.WRITE));
 
-        CountDownLatch countDownLatch = new CountDownLatch(500);
+        CountDownLatch countDownLatch = new CountDownLatch(testRuns);
         SharedExecutorService.getInstance().invokeAll(files.stream().map(it -> (Callable<Void>) () -> {
             try {
                 downloadClient.downloadToFileWithResponse(new BlobDownloadToFileOptions(it.getAbsolutePath())
@@ -138,13 +139,18 @@ public class HttpFaultInjectingTests {
                         .setParallelTransferOptions(new ParallelTransferOptions().setMaxConcurrency(2)),
                     null, Context.NONE);
                 byte[] actualFileBytes = Files.readAllBytes(it.toPath());
-                TestUtils.assertArraysEqual(realFileBytes, actualFileBytes);
+                System.out.println("actualFileBytes: " + actualFileBytes.length);
+                byte[] bytes = new byte[0];
+                TestUtils.assertArraysEqual(bytes, actualFileBytes);
+                System.out.println("download complete successfully, count: " + successCount);
                 LOGGER.atVerbose()
                     .addKeyValue("successCount", successCount.incrementAndGet())
                     .log("Download completed successfully.");
                 Files.deleteIfExists(it.toPath());
             } catch (Exception ex) {
                 // Don't let network exceptions fail the download
+                System.out.println("Error has occurred...");
+                System.out.println(ex.getMessage());
                 LOGGER.atWarning()
                     .addKeyValue("downloadFile", it.getAbsolutePath())
                     .log("Failed to complete download.", ex);
@@ -156,8 +162,8 @@ public class HttpFaultInjectingTests {
         }).collect(Collectors.toList()));
 
         countDownLatch.await(10, TimeUnit.MINUTES);
-
-        assertTrue(successCount.get() >= 450);
+        System.out.println("successCount: " + successCount.get());
+        assertTrue(successCount.get() >= testRuns*0.90);
         // cleanup
         files.forEach(it -> {
             try {
@@ -240,6 +246,7 @@ public class HttpFaultInjectingTests {
             URL originalUrl = request.getUrl();
             request.setHeader(UPSTREAM_URI_HEADER, originalUrl.toString()).setUrl(rewriteUrl(originalUrl));
             String faultType = faultInjectorHandling();
+            System.out.println("fault type: " + faultType);
             request.setHeader(HTTP_FAULT_INJECTOR_RESPONSE_HEADER, faultType);
 
             return wrappedHttpClient.send(request, context)

@@ -9,6 +9,7 @@ import com.azure.core.util.Context;
 import com.azure.identity.DefaultAzureCredential;
 import com.azure.identity.DefaultAzureCredentialBuilder;
 import com.azure.perf.test.core.PerfStressTest;
+import com.azure.storage.common.StorageSharedKeyCredential;
 import com.azure.storage.file.share.ShareAsyncClient;
 import com.azure.storage.file.share.ShareClient;
 import com.azure.storage.file.share.ShareServiceAsyncClient;
