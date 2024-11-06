@@ -67,7 +67,7 @@ public class FileShareTestBase extends TestProxyTestBase {
     protected static final String RECEIVED_LEASE_ID = "received";
     static final String GARBAGE_LEASE_ID = CoreUtils.randomUuid().toString();
 
-    URL testFolder = getClass().getClassLoader().getResource("testfiles");
+    public URL testFolder = getClass().getClassLoader().getResource("testfiles");
 
 
     // Clients for API tests
@@ -374,6 +374,10 @@ public class FileShareTestBase extends TestProxyTestBase {
 
     protected HttpClient getHttpClient() {
         return StorageCommonTestUtils.getHttpClient(interceptorManager);
+    }
+
+    public static HttpClient getHttpClient(Supplier<HttpClient> playbackClientSupplier) {
+        return StorageCommonTestUtils.getHttpClient(playbackClientSupplier);
     }
 
     protected String getPrimaryConnectionString() {

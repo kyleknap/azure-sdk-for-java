@@ -249,7 +249,7 @@ public class FileShareTestHelper {
     }
 
 
-    protected static void deleteFileIfExists(String folder, String fileName) throws IOException {
+    public static void deleteFileIfExists(String folder, String fileName) throws IOException {
         // Clean up all temporary generated files
         File dir = new File(folder);
         if (dir.isDirectory()) {
