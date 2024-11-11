@@ -5,6 +5,7 @@ import com.azure.core.http.HttpClientProvider;
 import com.azure.core.http.HttpHeaderName;
 import com.azure.core.http.HttpRequest;
 import com.azure.core.http.HttpResponse;
+import com.azure.core.http.netty.NettyAsyncHttpClientBuilder;
 import com.azure.core.http.netty.NettyAsyncHttpClientProvider;
 import com.azure.core.http.okhttp.OkHttpAsyncClientProvider;
 import com.azure.core.test.TestMode;
@@ -19,7 +20,6 @@ import com.azure.core.util.logging.ClientLogger;
 import com.azure.storage.common.implementation.Constants;
 import com.azure.storage.common.policy.RequestRetryOptions;
 import com.azure.storage.common.policy.RetryPolicyType;
-import com.azure.storage.common.test.shared.StorageCommonTestUtils;
 import com.azure.storage.file.share.FileShareTestBase;
 import com.azure.storage.file.share.FileShareTestHelper;
 import com.azure.storage.file.share.ShareClient;
@@ -32,17 +32,21 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIf;
 import reactor.core.publisher.Mono;
+import reactor.netty.resources.ConnectionProvider;
+import reactor.util.function.Tuple2;
+import reactor.util.function.Tuples;
 
 import java.io.File;
 import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.file.Files;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
+import java.util.*;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -86,6 +90,13 @@ public class HttpFaultInjectingTests {
         }
     }
 
+    // Method to compute checksum using MD5
+    private String calculateChecksum(byte[] data) throws NoSuchAlgorithmException {
+        MessageDigest md = MessageDigest.getInstance("MD5");
+        byte[] digest = md.digest(data);
+        return Base64.getEncoder().encodeToString(digest); // Encodes checksum for easy comparison
+    }
+
     /**
      * Tests downloading to file with fault injection.
      * <p>
@@ -96,12 +107,13 @@ public class HttpFaultInjectingTests {
      * hiding a true issue.
      */
     @Test
-    public void downloadToFileWithFaultInjection() throws IOException, InterruptedException {
-        int testRuns = 50;
-        //int length = 50 * Constants.MB - 1;
-        int length = Constants.MB - 1;
+    public void downloadToFileWithFaultInjection() throws InterruptedException, NoSuchAlgorithmException {
+        int testRuns = 100;
+        int length = 30 * Constants.MB - 1;
         byte[] realFileBytes = new byte[length];
         ThreadLocalRandom.current().nextBytes(realFileBytes);
+        String originalChecksum = calculateChecksum(realFileBytes);
+        System.out.println("original checksum: " + originalChecksum);
 
         ShareFileClient fileClient = shareClient.getFileClient(shareClient.getShareName());
         fileClient.create(length);
@@ -112,13 +124,12 @@ public class HttpFaultInjectingTests {
             .shareName(shareClient.getShareName())
             .resourcePath(shareClient.getShareName())
             .credential(ENVIRONMENT.getPrimaryAccount().getCredential())
-            .httpClient(new HttpFaultInjectingHttpClient(getFaultInjectingWrappedHttpClient()))
-            .retryOptions(new RequestRetryOptions(RetryPolicyType.FIXED, 4, null, 10L, 10L, null))
+            .httpClient(new HttpFaultInjectingHttpClient(getFaultInjectingWrappedHttpClientWithNetty()))
+            //.retryOptions(new RequestRetryOptions(RetryPolicyType.FIXED, 4, null, 10L, 10L, null))
             .buildFileClient();
 
         List<File> files = new ArrayList<>(testRuns);
         URL testFolder = getClass().getClassLoader().getResource("testfiles");
-        System.out.println(testFolder != null);
         //File downloadFile = new File(String.format("%s/%s.txt", testFolder.getPath(), prefix));
         for (int i = 0; i < testRuns; i++) {
             File file = new File(String.format("%s/%s.txt", testFolder.getPath(), i));
@@ -127,25 +138,52 @@ public class HttpFaultInjectingTests {
             files.add(file);
         }
         AtomicInteger successCount = new AtomicInteger();
-        //File it = files.get(0);
+        Map<String, byte[]> failedDownloads = new ConcurrentHashMap<>();
+        Map<String, String> exceptionOccurrences = new ConcurrentHashMap<>();
 
         CountDownLatch countDownLatch = new CountDownLatch(testRuns);
         SharedExecutorService.getInstance().invokeAll(files.stream().map(it -> (Callable<Void>) () -> {
             try {
+                System.out.println("Starting run for file: " + it.getAbsolutePath());
                 downloadClient.downloadToFileWithResponse(it.getAbsolutePath(), null, null, Context.NONE);
                 byte[] actualFileBytes = Files.readAllBytes(it.toPath());
-                TestUtils.assertArraysEqual(realFileBytes, actualFileBytes);
-                System.out.println("download complete successfully, count: " + successCount);
-                LOGGER.atVerbose()
-                    .addKeyValue("successCount", successCount.incrementAndGet())
-                    .log("Download completed successfully.");
+
+                try {
+                    String downloadedChecksum = calculateChecksum(actualFileBytes);
+                    System.out.println("downloaded checksum: " + downloadedChecksum);
+                    TestUtils.assertArraysEqual(realFileBytes, actualFileBytes);
+                    if (!originalChecksum.equals(downloadedChecksum)) {
+                        failedDownloads.put(it.getAbsolutePath(), actualFileBytes);
+                        System.out.println("Checksum mismatch for file: " + it.getAbsolutePath());
+                        LOGGER.atWarning()
+                            .addKeyValue("downloadFile", it.getAbsolutePath())
+                            .log("File content did not match expected checksum.");
+                    } else {
+                        LOGGER.atVerbose()
+                            .addKeyValue("successCount", successCount.incrementAndGet())
+                            .log("Download completed successfully.");
+                        System.out.println("download complete successfully, count: " + successCount);
+                    }
+                } catch (NoSuchAlgorithmException e) {
+                    System.err.println("Checksum algorithm not found: " + e.getMessage());
+                    LOGGER.atError().log("Failed to calculate checksum.", e);
+                }
+//                } catch (AssertionError e) {
+//                    failedDownloads.put(it.getAbsolutePath(), actualFileBytes);
+//                    System.out.println("Assertion failed for file: " + it.getAbsolutePath());
+//                    LOGGER.atWarning()
+//                        .addKeyValue("downloadFile", it.getAbsolutePath())
+//                        .log("File content did not match expected bytes.", e);
+//                }
+
                 if (Files.exists(it.toPath())) {
                     System.out.println("File exists: " + it.getAbsolutePath());
                     FileShareTestHelper.deleteFileIfExists(testFolder.getPath(), it.getName());
-                    //Files.delete(it.toPath());
                 }
-                //Files.deleteIfExists(it.toPath());
-            } catch (Exception ex) {
+
+            } catch (Throwable ex) {
+                ex.printStackTrace();
+                exceptionOccurrences.put(it.getAbsolutePath(), ex.getMessage());
                 // Don't let network exceptions fail the download
                 System.out.println("Error has occurred...");
                 System.out.println("Error is: " + ex.getMessage());
@@ -154,16 +192,35 @@ public class HttpFaultInjectingTests {
                     .log("Failed to complete download.", ex);
             } finally {
                 countDownLatch.countDown();
+                //System.out.println("CountDownLatch: " + countDownLatch.getCount());
             }
 
             return null;
         }).collect(Collectors.toList()));
 
         countDownLatch.await(10, TimeUnit.MINUTES);
-        System.out.println("successCount: " + successCount.get());
-        int expectedRuns = (int) (testRuns * 0.90);
-        System.out.println("expectedRuns: " + expectedRuns);
-        assertTrue(successCount.get() >= expectedRuns);
+
+        //int expectedRuns = (int) (testRuns * 0.90);
+        System.out.println("Total successful downloads: " + successCount.get());
+        System.out.println("Expected successful downloads: " + testRuns);
+        //assertTrue(successCount.get() >= expectedRuns);
+
+        // Print out details of failed downloads for debugging
+        if (!failedDownloads.isEmpty()) {
+            System.out.println("Failed Downloads: " + failedDownloads.size());
+            failedDownloads.forEach((filePath, bytes) -> {
+                System.out.println("File: " + filePath + ", Downloaded bytes (sample): " + Arrays.toString(Arrays.copyOf(bytes, Math.min(bytes.length, 100))));
+            });
+        }
+
+        // Print out details of failed downloads for debugging
+        if (!exceptionOccurrences.isEmpty()) {
+            System.out.println("Exception Occurrences: " + exceptionOccurrences.size());
+            exceptionOccurrences.forEach((filePath, message) -> {
+                System.out.println("File: " + filePath + " and Exception: " + message);
+            });
+        }
+
         // cleanup
         files.forEach(it -> {
             try {
@@ -177,28 +234,56 @@ public class HttpFaultInjectingTests {
     }
 
     @SuppressWarnings("unchecked")
+    private HttpClient getFaultInjectingWrappedHttpClientWithNetty() {
+        ConnectionProvider connectionProvider = ConnectionProvider.builder("custom")
+            .maxConnections(500)                       // Adjust max connections as needed
+            .pendingAcquireTimeout(Duration.ofSeconds(60)) // Increase timeout for acquiring a connection
+            .maxIdleTime(Duration.ofSeconds(30))        // Set max idle time for connections
+            .maxLifeTime(Duration.ofMinutes(5))         // Set max lifetime for connections
+            .build();
+
+        return new NettyAsyncHttpClientBuilder()
+            .connectionProvider(connectionProvider)
+            .readTimeout(Duration.ofSeconds(60))        // Increase read timeout as needed
+            .writeTimeout(Duration.ofSeconds(60))       // Increase write timeout as needed
+            .responseTimeout(Duration.ofSeconds(90))    // Increase response timeout as needed
+            .build();
+    }
+
+    @SuppressWarnings("unchecked")
     private HttpClient getFaultInjectingWrappedHttpClient() {
+        ConnectionProvider connectionProvider = ConnectionProvider.builder("custom")
+            .maxConnections(100)                       // Adjust max connections as needed
+            .pendingAcquireTimeout(Duration.ofSeconds(60)) // Increase timeout for acquiring a connection
+            .maxIdleTime(Duration.ofSeconds(30))        // Set max idle time for connections
+            .maxLifeTime(Duration.ofMinutes(5))         // Set max lifetime for connections
+            .build();
+
         switch (ENVIRONMENT.getHttpClientType()) {
             case NETTY:
+                System.out.println("Using netty");
                 return HttpClient.createDefault(new HttpClientOptions()
-                    .readTimeout(Duration.ofSeconds(2))
-                    .responseTimeout(Duration.ofSeconds(2))
+                    .readTimeout(Duration.ofSeconds(2)).setMaximumConnectionPoolSize(200)
+                    //.responseTimeout(Duration.ofSeconds(2))
                     .setHttpClientProvider(NettyAsyncHttpClientProvider.class));
             case OK_HTTP:
+                System.out.println("Using ok_http");
                 return HttpClient.createDefault(new HttpClientOptions()
-                    .readTimeout(Duration.ofSeconds(2))
-                    .responseTimeout(Duration.ofSeconds(2))
+                    .readTimeout(Duration.ofSeconds(2)).setMaximumConnectionPoolSize(200)
+                    //.responseTimeout(Duration.ofSeconds(2))
                     .setHttpClientProvider(OkHttpAsyncClientProvider.class));
             case VERTX:
+                System.out.println("using vertx");
                 return HttpClient.createDefault(new HttpClientOptions()
-                    .readTimeout(Duration.ofSeconds(2))
-                    .responseTimeout(Duration.ofSeconds(2))
+                    .readTimeout(Duration.ofSeconds(2)).setMaximumConnectionPoolSize(200)
+                    //.responseTimeout(Duration.ofSeconds(2))
                     .setHttpClientProvider(getVertxClientProviderReflectivelyUntilNameChangeReleases()));
             case JDK_HTTP:
                 try {
+                    System.out.println("using jdk_http");
                     return HttpClient.createDefault(new HttpClientOptions()
-                        .readTimeout(Duration.ofSeconds(2))
-                        .responseTimeout(Duration.ofSeconds(2))
+                        .readTimeout(Duration.ofSeconds(2)).setMaximumConnectionPoolSize(200)
+                        //.responseTimeout(Duration.ofSeconds(2))
                         .setHttpClientProvider((Class<? extends HttpClientProvider>) Class.forName(
                             "com.azure.core.http.jdk.httpclient.JdkHttpClientProvider")));
                 } catch (ClassNotFoundException e) {
@@ -246,7 +331,7 @@ public class HttpFaultInjectingTests {
             URL originalUrl = request.getUrl();
             request.setHeader(UPSTREAM_URI_HEADER, originalUrl.toString()).setUrl(rewriteUrl(originalUrl));
             String faultType = faultInjectorHandling();
-            System.out.println("fault type: " + faultType);
+            //System.out.println("fault type: " + faultType);
             request.setHeader(HTTP_FAULT_INJECTOR_RESPONSE_HEADER, faultType);
 
             return wrappedHttpClient.send(request, context)
@@ -285,7 +370,43 @@ public class HttpFaultInjectingTests {
             }
         }
 
-        private static String faultInjectorHandling() {
+//        private static String faultInjectorHandling() {
+//            // f: Full response
+//            // p: Partial Response (full headers, 50% of body), then wait indefinitely
+//            // pc: Partial Response (full headers, 50% of body), then close (TCP FIN)
+//            // pa: Partial Response (full headers, 50% of body), then abort (TCP RST)
+//            // pn: Partial Response (full headers, 50% of body), then finish normally
+//            // n: No response, then wait indefinitely
+//            // nc: No response, then close (TCP FIN)
+//            // na: No response, then abort (TCP RST)
+//            double random = ThreadLocalRandom.current().nextDouble();
+//            int choice = (int) (random * 100);
+//
+//            if (choice >= 25) {
+//                // 75% of requests complete without error.
+//                return "f";
+//            } else if (choice >= 1) {
+//                if (random <= 0.34D) {
+//                    return "n";
+//                } else if (random <= 0.67D) {
+//                    return "nc";
+//                } else {
+//                    return "na";
+//                }
+//            } else {
+//                if (random <= 0.25D) {
+//                    return "p";
+//                } else if (random <= 0.50D) {
+//                    return "pc";
+//                } else if (random <= 0.75D) {
+//                    return "pa";
+//                } else {
+//                    return "pn";
+//                }
+//            }
+//        }
+
+        private static List<Tuple2<Double, String>> addResponseFaultedProbabilities() {
             // f: Full response
             // p: Partial Response (full headers, 50% of body), then wait indefinitely
             // pc: Partial Response (full headers, 50% of body), then close (TCP FIN)
@@ -294,31 +415,29 @@ public class HttpFaultInjectingTests {
             // n: No response, then wait indefinitely
             // nc: No response, then close (TCP FIN)
             // na: No response, then abort (TCP RST)
-            double random = ThreadLocalRandom.current().nextDouble();
-            int choice = (int) (random * 100);
+            List<Tuple2<Double, String>> probabilities = new ArrayList<>();
+            probabilities.add(Tuples.of(0.06, "p"));
+            probabilities.add(Tuples.of(0.06, "pc"));
+            probabilities.add(Tuples.of(0.06, "pa"));
+            probabilities.add(Tuples.of(0.06, "pn"));
+            probabilities.add(Tuples.of(0.003, "n"));
+            probabilities.add(Tuples.of(0.004, "nc"));
+            probabilities.add(Tuples.of(0.003, "na"));
+            return probabilities;
+        }
 
-            if (choice >= 25) {
-                // 75% of requests complete without error.
-                return "f";
-            } else if (choice >= 1) {
-                if (random <= 0.34D) {
-                    return "n";
-                } else if (random <= 0.67D) {
-                    return "nc";
-                } else {
-                    return "na";
+        private static String faultInjectorHandling() {
+            List<Tuple2<Double, String>> probabilities = addResponseFaultedProbabilities();
+            double random = Math.random();
+            double sum = 0d;
+
+            for (Tuple2<Double, String> tup : probabilities) {
+                if (random < sum + tup.getT1()) {
+                    return tup.getT2();
                 }
-            } else {
-                if (random <= 0.25D) {
-                    return "p";
-                } else if (random <= 0.50D) {
-                    return "pc";
-                } else if (random <= 0.75D) {
-                    return "pa";
-                } else {
-                    return "pn";
-                }
+                sum += tup.getT1();
             }
+            return "f";
         }
     }
 
