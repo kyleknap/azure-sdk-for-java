@@ -39,17 +39,17 @@ import reactor.util.function.Tuples;
 import java.io.File;
 import java.io.IOException;
 import java.net.MalformedURLException;
+import java.net.URISyntaxException;
 import java.net.URL;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -129,20 +129,17 @@ public class HttpFaultInjectingTests {
             .buildFileClient();
 
         List<File> files = new ArrayList<>(testRuns);
-        URL testFolder = getClass().getClassLoader().getResource("testfiles");
-        //File downloadFile = new File(String.format("%s/%s.txt", testFolder.getPath(), prefix));
+        Path testFolder = cleanAndCreateTestFolder(getClass().getClassLoader().getResource("testfiles"));
         for (int i = 0; i < testRuns; i++) {
-            File file = new File(String.format("%s/%s.txt", testFolder.getPath(), i));
-            //File file = File.createTempFile(CoreUtils.randomUuid().toString() + i, ".txt");
-            file.deleteOnExit();
+            File file = new File(String.format("%s/%s.txt", testFolder, i));
             files.add(file);
         }
         AtomicInteger successCount = new AtomicInteger();
         Map<String, byte[]> failedDownloads = new ConcurrentHashMap<>();
         Map<String, String> exceptionOccurrences = new ConcurrentHashMap<>();
 
-        CountDownLatch countDownLatch = new CountDownLatch(testRuns);
-        SharedExecutorService.getInstance().invokeAll(files.stream().map(it -> (Callable<Void>) () -> {
+        ExecutorService executor = Executors.newFixedThreadPool(20);
+        executor.invokeAll(files.stream().map(it -> (Callable<Void>) () -> {
             try {
                 System.out.println("Starting run for file: " + it.getAbsolutePath());
                 downloadClient.downloadToFileWithResponse(it.getAbsolutePath(), null, null, Context.NONE);
@@ -164,21 +161,12 @@ public class HttpFaultInjectingTests {
                             .log("Download completed successfully.");
                         System.out.println("download complete successfully, count: " + successCount);
                     }
+//                    if (Files.exists(it.toPath())) {
+//                        FileShareTestHelper.deleteFileIfExists(testFolder.toString(), it.getName());
+//                    }
                 } catch (NoSuchAlgorithmException e) {
                     System.err.println("Checksum algorithm not found: " + e.getMessage());
                     LOGGER.atError().log("Failed to calculate checksum.", e);
-                }
-//                } catch (AssertionError e) {
-//                    failedDownloads.put(it.getAbsolutePath(), actualFileBytes);
-//                    System.out.println("Assertion failed for file: " + it.getAbsolutePath());
-//                    LOGGER.atWarning()
-//                        .addKeyValue("downloadFile", it.getAbsolutePath())
-//                        .log("File content did not match expected bytes.", e);
-//                }
-
-                if (Files.exists(it.toPath())) {
-                    System.out.println("File exists: " + it.getAbsolutePath());
-                    FileShareTestHelper.deleteFileIfExists(testFolder.getPath(), it.getName());
                 }
 
             } catch (Throwable ex) {
@@ -190,15 +178,11 @@ public class HttpFaultInjectingTests {
                 LOGGER.atWarning()
                     .addKeyValue("downloadFile", it.getAbsolutePath())
                     .log("Failed to complete download.", ex);
-            } finally {
-                countDownLatch.countDown();
-                //System.out.println("CountDownLatch: " + countDownLatch.getCount());
             }
 
             return null;
-        }).collect(Collectors.toList()));
+        }).collect(Collectors.toList()), 10, TimeUnit.MINUTES);
 
-        countDownLatch.await(10, TimeUnit.MINUTES);
 
         //int expectedRuns = (int) (testRuns * 0.90);
         System.out.println("Total successful downloads: " + successCount.get());
@@ -220,17 +204,35 @@ public class HttpFaultInjectingTests {
                 System.out.println("File: " + filePath + " and Exception: " + message);
             });
         }
+    }
 
-        // cleanup
-        files.forEach(it -> {
+    public Path cleanAndCreateTestFolder(URL baseTestFolderUrl) {
+
+        if (baseTestFolderUrl != null) {
+            Path subdirectoryPath = null;
             try {
-                Files.deleteIfExists(it.toPath());
-            } catch (IOException e) {
-                LOGGER.atWarning()
-                    .addKeyValue("file", it.getAbsolutePath())
-                    .log("Failed to delete file.", e);
+                Path testFolderPath = Paths.get(baseTestFolderUrl.toURI());
+                subdirectoryPath = testFolderPath.resolve("download-files");
+
+                if (Files.exists(subdirectoryPath)) {
+                    try (DirectoryStream<Path> directoryStream = Files.newDirectoryStream(subdirectoryPath)) {
+                        for (Path path : directoryStream) {
+                            Files.delete(path);
+                        }
+                    }
+                    Files.delete(subdirectoryPath);
+                }
+
+                if (!Files.exists(subdirectoryPath)) {
+                    Files.createDirectory(subdirectoryPath);
+                    System.out.println("Created subdirectory: " + subdirectoryPath);
+                }
+            } catch (Exception e) {
+                System.err.println("Error deleting test folder: " + e.getMessage());
             }
-        });
+            return subdirectoryPath;
+        }
+        return null;
     }
 
     @SuppressWarnings("unchecked")
@@ -369,42 +371,6 @@ public class HttpFaultInjectingTests {
                 throw new RuntimeException(e);
             }
         }
-
-//        private static String faultInjectorHandling() {
-//            // f: Full response
-//            // p: Partial Response (full headers, 50% of body), then wait indefinitely
-//            // pc: Partial Response (full headers, 50% of body), then close (TCP FIN)
-//            // pa: Partial Response (full headers, 50% of body), then abort (TCP RST)
-//            // pn: Partial Response (full headers, 50% of body), then finish normally
-//            // n: No response, then wait indefinitely
-//            // nc: No response, then close (TCP FIN)
-//            // na: No response, then abort (TCP RST)
-//            double random = ThreadLocalRandom.current().nextDouble();
-//            int choice = (int) (random * 100);
-//
-//            if (choice >= 25) {
-//                // 75% of requests complete without error.
-//                return "f";
-//            } else if (choice >= 1) {
-//                if (random <= 0.34D) {
-//                    return "n";
-//                } else if (random <= 0.67D) {
-//                    return "nc";
-//                } else {
-//                    return "na";
-//                }
-//            } else {
-//                if (random <= 0.25D) {
-//                    return "p";
-//                } else if (random <= 0.50D) {
-//                    return "pc";
-//                } else if (random <= 0.75D) {
-//                    return "pa";
-//                } else {
-//                    return "pn";
-//                }
-//            }
-//        }
 
         private static List<Tuple2<Double, String>> addResponseFaultedProbabilities() {
             // f: Full response
